@@ -1,0 +1,13 @@
+image:
+  repository: alpine
+  tag: "3.20"
+  pullPolicy: IfNotPresent
+
+keycloak:
+  url: "https://keycloak.networxs.local/auth"
+  username: "admin"
+  password: "admin"
+  realm: "master"
+  clientId: "clientId"
+  clientName: "app-e2ei-oauth-client-2-3"
+

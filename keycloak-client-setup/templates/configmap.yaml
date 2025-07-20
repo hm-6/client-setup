@@ -1,0 +1,192 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "keycloak-client-setup.fullname" . }}-script
+data:
+  setup.sh: |
+    #!/bin/bash
+    set -euxo pipefail
+
+    log() { echo "$(date +'%F %T') $*"; }
+
+    KEYCLOAK_URL="{{ .Values.keycloak.url }}"
+    USERNAME="{{ .Values.keycloak.username }}"
+    PASSWORD="{{ .Values.keycloak.password }}"
+    REALM="{{ .Values.keycloak.realm }}"
+    CLIENT_ID="{{ .Values.keycloak.clientId }}"
+    CLIENT_NAME="{{ .Values.keycloak.clientName }}"
+
+    REDIRECT_URIS='["https://webapp.example.com/oidc", "wire://e2ei/oauth2redirect"]'
+    WEB_ORIGINS='["https://webapp.example.com"]'
+
+    # jq und curl installieren (falls nicht vorhanden, nur für Alpine)
+    command -v jq >/dev/null 2>&1 || apk add --no-cache jq
+    command -v curl >/dev/null 2>&1 || apk add --no-cache curl
+
+    # Warte auf Keycloak-API (max. 2 Minuten)
+    for i in $(seq 1 2); do
+      if curl -ksf "$KEYCLOAK_URL/realms/$REALM"; then
+        log "Keycloak-API erreichbar."
+        break
+      fi
+      log "Warte auf Keycloak-API... ($i/24)"
+      sleep 5
+    done
+
+    # 1. Access-Token holen
+    log "Hole Access Token..."
+    TOKEN=$(curl -s -k \
+      -d "client_id=admin-cli" \
+      -d "username=$USERNAME" \
+      -d "password=$PASSWORD" \
+      -d "grant_type=password" \
+      "$KEYCLOAK_URL/realms/$REALM/protocol/openid-connect/token" | jq -r .access_token)
+
+    if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+      log "FEHLER: Kein Access Token erhalten!"
+      exit 1
+    fi
+
+    # 2. Existenzprüfung: Client darf nicht existieren
+    log "Prüfe, ob Client $CLIENT_ID bereits existiert..."
+    CLIENT_EXISTS=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
+      "$KEYCLOAK_URL/admin/realms/$REALM/clients?clientId=$CLIENT_ID" | jq 'length')
+
+    if [ "$CLIENT_EXISTS" != "0" ]; then
+      log "Client $CLIENT_ID existiert bereits. Abbruch."
+      exit 100
+    fi
+
+    # 3. Client anlegen
+    log "Lege Client $CLIENT_ID an..."
+    HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X POST \
+      "$KEYCLOAK_URL/admin/realms/$REALM/clients" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"clientId\": \"$CLIENT_ID\",
+        \"name\": \"$CLIENT_NAME\",
+        \"protocol\": \"openid-connect\",
+        \"publicClient\": true,
+        \"standardFlowEnabled\": true,
+        \"implicitFlowEnabled\": false,
+        \"directAccessGrantsEnabled\": false,
+        \"serviceAccountsEnabled\": false,
+        \"authorizationServicesEnabled\": false,
+        \"redirectUris\": $REDIRECT_URIS,
+        \"webOrigins\": $WEB_ORIGINS,
+        \"enabled\": true
+      }")
+    if [ "$HTTP_CODE" -ne 201 ]; then
+      log "FEHLER: Client konnte nicht erstellt werden (HTTP $HTTP_CODE)."
+      exit 2
+    fi
+
+    # 4. Client-UUID holen
+    log "Lese Client-UUID..."
+    CLIENT_UUID=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
+      "$KEYCLOAK_URL/admin/realms/$REALM/clients?clientId=$CLIENT_ID" | jq -r '.[0].id')
+    if [ -z "$CLIENT_UUID" ] || [ "$CLIENT_UUID" = "null" ]; then
+      log "FEHLER: Konnte Client-UUID nicht ermitteln."
+      exit 3
+    fi
+
+    # 5. Client-Konfiguration updaten
+    log "Aktualisiere Client-Konfiguration..."
+    HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X PUT \
+      "$KEYCLOAK_URL/admin/realms/$REALM/clients/$CLIENT_UUID" \
+      -H "Authorization: Bearer $TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "{
+        \"id\": \"$CLIENT_UUID\",
+        \"clientId\": \"$CLIENT_ID\",
+        \"name\": \"$CLIENT_ID\",
+        \"protocol\": \"openid-connect\",
+        \"publicClient\": true,
+        \"standardFlowEnabled\": true,
+        \"implicitFlowEnabled\": false,
+        \"directAccessGrantsEnabled\": false,
+        \"serviceAccountsEnabled\": false,
+        \"authorizationServicesEnabled\": false,
+        \"redirectUris\": $REDIRECT_URIS,
+        \"webOrigins\": $WEB_ORIGINS,
+        \"attributes\": {
+          \"login_theme\": \"keycloak\",
+          \"frontchannel.logout\": \"true\",
+          \"use.refresh.tokens\": \"true\",
+          \"access.token.lifespan\": \"180\",
+          \"oauth2.device.authorization.grant.enabled\": \"false\",
+          \"tls.client.certificate.bound.access.tokens\": \"false\",
+          \"use.lower.case.bearer\": \"false\",
+          \"pushed.authorization.requests.enabled\": \"false\"
+        },
+        \"enabled\": true
+      }")
+    if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -gt 299 ]; then
+      log "FEHLER: Client-Update fehlgeschlagen (HTTP $HTTP_CODE)."
+      exit 4
+    fi
+
+    # 6. Client Scope "profile" suchen
+    log "Suche Client Scope 'profile'..."
+    CLIENT_SCOPE_ID=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
+      "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes" | jq -r '.[] | select(.name=="profile") | .id')
+    if [ -z "$CLIENT_SCOPE_ID" ] || [ "$CLIENT_SCOPE_ID" = "null" ]; then
+      log "FEHLER: Konnte Client Scope 'profile' nicht finden."
+      exit 5
+    fi
+
+    # Helper für Protocol Mapper
+    create_or_update_mapper() {
+      local MAPPER_NAME="$1"
+      log "Bearbeite Protocol Mapper '$MAPPER_NAME'..."
+      MAPPER_ID=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
+        "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes/$CLIENT_SCOPE_ID/protocol-mappers/models" \
+        | jq -r ".[] | select(.name==\"$MAPPER_NAME\") | .id")
+
+      MAPPER_PAYLOAD="{
+        \"name\": \"$MAPPER_NAME\",
+        \"protocol\": \"openid-connect\",
+        \"protocolMapper\": \"oidc-hardcoded-claim-mapper\",
+        \"consentRequired\": false,
+        \"config\": {
+          \"claim.name\": \"$MAPPER_NAME\",
+          \"claim.value\": \"true\",
+          \"id.token.claim\": \"true\",
+          \"access.token.claim\": \"false\",
+          \"userinfo.token.claim\": \"false\",
+          \"jsonType.label\": \"String\"
+        }
+      }"
+
+      if [ -n "$MAPPER_ID" ] && [ "$MAPPER_ID" != "null" ]; then
+        HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X PUT \
+          "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes/$CLIENT_SCOPE_ID/protocol-mappers/models/$MAPPER_ID" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$(echo "$MAPPER_PAYLOAD" | jq ". + {id: \"$MAPPER_ID\"}")")
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -gt 299 ]; then
+          log "FEHLER: Mapper '$MAPPER_NAME' Update fehlgeschlagen (HTTP $HTTP_CODE)."
+          exit 6
+        fi
+      else
+        HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X POST \
+          "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes/$CLIENT_SCOPE_ID/protocol-mappers/models" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "$MAPPER_PAYLOAD")
+        if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -gt 299 ]; then
+          log "FEHLER: Mapper '$MAPPER_NAME' Erstellen fehlgeschlagen (HTTP $HTTP_CODE)."
+          exit 7
+        fi
+      fi
+    }
+
+    # 7. Protocol Mapper "keyauth"
+    create_or_update_mapper "keyauth"
+
+    # 8. Protocol Mapper "acme_aud"
+    create_or_update_mapper "acme_aud"
+
+    log "Keycloak Client-Setup erfolgreich abgeschlossen."
+

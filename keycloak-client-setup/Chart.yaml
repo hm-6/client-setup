@@ -1,0 +1,5 @@
+apiVersion: v2
+name: keycloak-client-setup
+description: Keycloak API Script Job (automatisiert Client anlegen und konfigurieren)
+version: 0.1.0
+

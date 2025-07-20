@@ -1,0 +1,23 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "keycloak-client-setup.fullname" . }}
+spec:
+  backoffLimit: 2
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: keycloak-client-setup
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/bin/sh", "/script/setup.sh"]
+        volumeMounts:
+        - name: script
+          mountPath: /script
+      volumes:
+      - name: script
+        configMap:
+          name: {{ include "keycloak-client-setup.fullname" . }}-script
+          defaultMode: 0775
+
