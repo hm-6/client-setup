@@ -1,13 +1,17 @@
 image:
   repository: alpine
-  tag: "3.20"
+  tag: latest
   pullPolicy: IfNotPresent
 
 keycloak:
-  url: "https://keycloak.networxs.local/auth"
+  url: "https://keycloak.example.local/auth"
   username: "admin"
   password: "admin"
   realm: "master"
-  clientId: "clientId"
-  clientName: "app-e2ei-oauth-client-2-3"
-
+  clientId: "clientid1"
+  clientName: "oauth-client-2"
+  redirectUris:
+    - https://app.example.com/oidc
+    - wire://e2ei/oauth2redirect
+  webOrigins:
+    - https://app.example.com
