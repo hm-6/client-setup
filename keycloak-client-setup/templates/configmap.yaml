@@ -16,25 +16,20 @@ data:
     CLIENT_ID="{{ .Values.keycloak.clientId }}"
     CLIENT_NAME="{{ .Values.keycloak.clientName }}"
 
-    REDIRECT_URIS='["https://webapp.example.com/oidc", "wire://e2ei/oauth2redirect"]'
-    WEB_ORIGINS='["https://webapp.example.com"]'
-
-    # jq und curl installieren (falls nicht vorhanden, nur für Alpine)
-    command -v jq >/dev/null 2>&1 || apk add --no-cache jq
-    command -v curl >/dev/null 2>&1 || apk add --no-cache curl
+    REDIRECT_URIS='{{ .Values.keycloak.redirectUris | trim }}'
+    WEB_ORIGINS='{{ .Values.keycloak.webOrigins | trim }}'
 
     # Warte auf Keycloak-API (max. 2 Minuten)
-    for i in $(seq 1 2); do
+    for i in $(seq 1 3); do
       if curl -ksf "$KEYCLOAK_URL/realms/$REALM"; then
         log "Keycloak-API erreichbar."
         break
       fi
-      log "Warte auf Keycloak-API... ($i/24)"
+      log "Waiting for Keycloak-API... ($i/3)"
       sleep 5
     done
 
-    # 1. Access-Token holen
-    log "Hole Access Token..."
+    log "Retrieve access token..."
     TOKEN=$(curl -s -k \
       -d "client_id=admin-cli" \
       -d "username=$USERNAME" \
@@ -43,22 +38,20 @@ data:
       "$KEYCLOAK_URL/realms/$REALM/protocol/openid-connect/token" | jq -r .access_token)
 
     if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-      log "FEHLER: Kein Access Token erhalten!"
+      log "ERROR: no access token retrievable. Bye."
       exit 1
     fi
 
-    # 2. Existenzprüfung: Client darf nicht existieren
-    log "Prüfe, ob Client $CLIENT_ID bereits existiert..."
+    log "Checking for existing client..."
     CLIENT_EXISTS=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
       "$KEYCLOAK_URL/admin/realms/$REALM/clients?clientId=$CLIENT_ID" | jq 'length')
 
     if [ "$CLIENT_EXISTS" != "0" ]; then
-      log "Client $CLIENT_ID existiert bereits. Abbruch."
-      exit 100
+      log "Client $CLIENT_ID exists. No action taken. Bye."
+      exit 0
     fi
 
-    # 3. Client anlegen
-    log "Lege Client $CLIENT_ID an..."
+    log "Creating client ${CLIENT_ID}..."
     HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X POST \
       "$KEYCLOAK_URL/admin/realms/$REALM/clients" \
       -H "Authorization: Bearer $TOKEN" \
@@ -78,21 +71,19 @@ data:
         \"enabled\": true
       }")
     if [ "$HTTP_CODE" -ne 201 ]; then
-      log "FEHLER: Client konnte nicht erstellt werden (HTTP $HTTP_CODE)."
+      log "ERROR: couldn't create client (HTTP $HTTP_CODE). Bye."
       exit 2
     fi
 
-    # 4. Client-UUID holen
-    log "Lese Client-UUID..."
+    log "Retrieving client-UUID..."
     CLIENT_UUID=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
       "$KEYCLOAK_URL/admin/realms/$REALM/clients?clientId=$CLIENT_ID" | jq -r '.[0].id')
     if [ -z "$CLIENT_UUID" ] || [ "$CLIENT_UUID" = "null" ]; then
-      log "FEHLER: Konnte Client-UUID nicht ermitteln."
+      log "ERROR: couldn't retrieve Client-UUID. Bye."
       exit 3
     fi
 
-    # 5. Client-Konfiguration updaten
-    log "Aktualisiere Client-Konfiguration..."
+    log "updating client configuration..."
     HTTP_CODE=$(curl -k -s -o /dev/null -w "%{http_code}" -X PUT \
       "$KEYCLOAK_URL/admin/realms/$REALM/clients/$CLIENT_UUID" \
       -H "Authorization: Bearer $TOKEN" \
@@ -123,11 +114,10 @@ data:
         \"enabled\": true
       }")
     if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -gt 299 ]; then
-      log "FEHLER: Client-Update fehlgeschlagen (HTTP $HTTP_CODE)."
+      log "ERROR: client-update failed (HTTP $HTTP_CODE)."
       exit 4
     fi
 
-    # 6. Client Scope "profile" suchen
     log "Suche Client Scope 'profile'..."
     CLIENT_SCOPE_ID=$(curl -s -k -H "Authorization: Bearer $TOKEN" \
       "$KEYCLOAK_URL/admin/realms/$REALM/client-scopes" | jq -r '.[] | select(.name=="profile") | .id')
@@ -189,4 +179,3 @@ data:
     create_or_update_mapper "acme_aud"
 
     log "Keycloak Client-Setup erfolgreich abgeschlossen."
-
